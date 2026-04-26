@@ -4,10 +4,15 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"sync"
 	"time"
 )
+
+const diskCacheFile = "ccusage_pricing_cache.json"
 
 type Service struct {
 	client    *http.Client
@@ -62,7 +67,45 @@ func (s *Service) GetModelPrice(ctx context.Context, model string) (inputPrice, 
 	return s.getEmbeddedPricing(model)
 }
 
+func diskCachePath() string {
+	return filepath.Join(os.TempDir(), diskCacheFile)
+}
+
+func (s *Service) loadDiskCache() (LiteLLMResponse, bool) {
+	path := diskCachePath()
+	info, err := os.Stat(path)
+	if err != nil || time.Since(info.ModTime()) > s.cacheTTL {
+		return nil, false
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, false
+	}
+	var response LiteLLMResponse
+	if err := json.Unmarshal(data, &response); err != nil {
+		return nil, false
+	}
+	return response, true
+}
+
+func saveDiskCache(response LiteLLMResponse) {
+	data, err := json.Marshal(response)
+	if err != nil {
+		return
+	}
+	os.WriteFile(diskCachePath(), data, 0600) //nolint:errcheck
+}
+
 func (s *Service) refreshCache(ctx context.Context) error {
+	// Try disk cache first to avoid a network round-trip on every run.
+	if response, ok := s.loadDiskCache(); ok {
+		s.cacheMux.Lock()
+		s.cache = response
+		s.cacheTime = time.Now()
+		s.cacheMux.Unlock()
+		return nil
+	}
+
 	req, err := http.NewRequestWithContext(ctx, "GET", "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json", nil)
 	if err != nil {
 		return err
@@ -78,10 +121,17 @@ func (s *Service) refreshCache(ctx context.Context) error {
 		return fmt.Errorf("API returned status %d", resp.StatusCode)
 	}
 
-	var response LiteLLMResponse
-	if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 10<<20)) // 10 MB cap
+	if err != nil {
 		return err
 	}
+
+	var response LiteLLMResponse
+	if err := json.Unmarshal(body, &response); err != nil {
+		return err
+	}
+
+	saveDiskCache(response)
 
 	s.cacheMux.Lock()
 	s.cache = response

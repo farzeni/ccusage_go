@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -36,8 +37,12 @@ type Loader struct {
 }
 
 func New() *Loader {
+	workers := runtime.NumCPU()
+	if workers > 8 {
+		workers = 8
+	}
 	return &Loader{
-		maxWorkers: 1, // Single worker to minimize CPU and memory usage
+		maxWorkers: workers,
 		debug:      false,
 		timezone:   time.Local,
 	}
@@ -118,19 +123,13 @@ func (l *Loader) LoadFromPathWithOptions(ctx context.Context, path string, optio
 		return nil, types.ErrDataNotFound
 	}
 
-	// Sort files by earliest timestamp (like TypeScript version)
-	sortedPaths, err := l.sortFilesByTimestamp(paths)
+	// Sort files by modification time (cheap: only stat calls, no file reads).
+	// For Claude Code JSONL files mtime tracks content time closely enough.
+	sortedPaths, err := l.sortFilesByModTime(paths)
 	if err != nil {
-		// If sorting fails, use original order
 		sortedPaths = paths
-		if l.debug {
-			fmt.Fprintf(os.Stderr, "Debug: Failed to sort files by timestamp, using default order: %v\n", err)
-		}
 	} else {
 		paths = sortedPaths
-		if l.debug {
-			fmt.Fprintf(os.Stderr, "Debug: Sorted files by timestamp\n")
-		}
 	}
 
 	// Use LoadParallelWithOptions if stream processing is enabled
@@ -194,6 +193,16 @@ func (l *Loader) LoadParallelWithOptions(ctx context.Context, paths []string, op
 				case <-ctx.Done():
 					return
 				default:
+					// Check per-file disk cache first.
+					info, statErr := os.Stat(path)
+					if statErr == nil {
+						if cachedEntries, cachedNames, ok := loadFileCache(path, info.ModTime()); ok {
+							results <- result{entries: cachedEntries, sessionNames: cachedNames}
+							continue
+						}
+					}
+
+					// Cache miss: parse the file normally.
 					entries, sessionNames, err := l.loadFileWithGlobalDedupe(path, &dedupeMutex, globalDedupeMap)
 
 					// Stream processing: calculate costs immediately if enabled
@@ -223,6 +232,11 @@ func (l *Loader) LoadParallelWithOptions(ctx context.Context, paths []string, op
 					}
 
 					results <- result{entries: entries, sessionNames: sessionNames, err: err}
+
+					// Persist to disk cache for future runs (only on successful parse).
+					if err == nil && statErr == nil {
+						go saveFileCache(path, info.ModTime(), entries, sessionNames)
+					}
 				}
 			}
 		}()
@@ -754,9 +768,9 @@ func (l *Loader) sortFilesByModTime(files []string) ([]string, error) {
 		}
 	}
 	
-	// Sort by modification time (newest first)
+	// Sort by modification time (oldest first, matching timestamp-sort behavior)
 	sort.Slice(filesWithTime, func(i, j int) bool {
-		return filesWithTime[i].modTime.After(filesWithTime[j].modTime)
+		return filesWithTime[i].modTime.Before(filesWithTime[j].modTime)
 	})
 	
 	// Extract sorted file paths
