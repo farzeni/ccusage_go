@@ -227,13 +227,13 @@ func buildStatusline(hookData statuslineHookData, entries []types.UsageEntry, ca
 	}
 
 	parts := []string{
-		"🤖 " + modelName,
-		"💰 " + sessionCostStr + " session / $" + fmt.Sprintf("%.2f", todayCost) + " today / " + blockStr,
+		modelName,
+		contextStr,
+		"$" + fmt.Sprintf("%.2f", todayCost) + " today / " + sessionCostStr + " session / " + blockStr,
 	}
 	if burnRateStr != "" {
-		parts = append(parts, "🔥 "+burnRateStr)
+		parts = append(parts, burnRateStr)
 	}
-	parts = append(parts, "🧠 "+contextStr)
 
 	var sb strings.Builder
 	for i, p := range parts {
@@ -285,35 +285,30 @@ func formatRemaining(d time.Duration) string {
 func formatBurnRate(costPerHour, tokensPerMinute float64, mode string) string {
 	base := fmt.Sprintf("$%.2f/hr", costPerHour)
 
-	var emoji, text, color string
+	var indicator, color string
 	switch {
 	case tokensPerMinute < burnRateLow:
-		emoji = "🟢"
-		text = "Normal"
+		indicator = "normal"
 		color = "\033[32m"
 	case tokensPerMinute < burnRateMedium:
-		emoji = "⚠️"
-		text = "Moderate"
+		indicator = "moderate"
 		color = "\033[33m"
 	default:
-		emoji = "🚨"
-		text = "High"
+		indicator = "high"
 		color = "\033[31m"
 	}
 
 	coloredBase := color + base + "\033[0m"
 
 	switch mode {
-	case "emoji":
-		return coloredBase + " " + emoji
-	case "text":
-		return coloredBase + " (" + text + ")"
-	case "emoji-text":
-		return coloredBase + " " + emoji + " (" + text + ")"
+	case "text", "emoji", "emoji-text":
+		return coloredBase + " (" + indicator + ")"
 	default: // off
 		return coloredBase
 	}
 }
+
+const progressBarWidth = 12
 
 func formatContextUsage(hookData statuslineHookData, lowThreshold, mediumThreshold int) string {
 	inputTokens, contextLimit := resolveContextTokens(hookData)
@@ -321,7 +316,8 @@ func formatContextUsage(hookData statuslineHookData, lowThreshold, mediumThresho
 		return "N/A"
 	}
 
-	percentage := int(float64(inputTokens) / float64(contextLimit) * 100)
+	pct := float64(inputTokens) / float64(contextLimit)
+	percentage := int(pct * 100)
 
 	var color string
 	switch {
@@ -333,7 +329,10 @@ func formatContextUsage(hookData statuslineHookData, lowThreshold, mediumThresho
 		color = "\033[31m"
 	}
 
-	return fmt.Sprintf("%s %s(%d%%)\033[0m", formatNumber(inputTokens), color, percentage)
+	filled := min(int(pct*progressBarWidth), progressBarWidth)
+	bar := strings.Repeat("█", filled) + strings.Repeat("░", progressBarWidth-filled)
+
+	return fmt.Sprintf("%s[%s] %d%%\033[0m", color, bar, percentage)
 }
 
 // resolveContextTokens returns (inputTokens, contextWindowLimit).
