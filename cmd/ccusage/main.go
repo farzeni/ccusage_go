@@ -28,6 +28,7 @@ func main() {
 		commands.NewSessionCommand(),
 		commands.NewBlocksCommand(),
 		commands.NewMonitorCommand(),
+		commands.NewStatuslineCommand(),
 	)
 
 	if err := rootCmd.ExecuteContext(ctx); err != nil {
