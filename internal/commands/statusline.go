@@ -316,15 +316,12 @@ func formatBurnRate(costPerHour, tokensPerMinute float64, mode string) string {
 }
 
 func formatContextUsage(hookData statuslineHookData, lowThreshold, mediumThreshold int) string {
-	if hookData.ContextWindow == nil {
-		return "N/A"
-	}
-	cw := hookData.ContextWindow
-	if cw.ContextWindow <= 0 {
+	inputTokens, contextLimit := resolveContextTokens(hookData)
+	if contextLimit <= 0 {
 		return "N/A"
 	}
 
-	percentage := int(float64(cw.InputTokens) / float64(cw.ContextWindow) * 100)
+	percentage := int(float64(inputTokens) / float64(contextLimit) * 100)
 
 	var color string
 	switch {
@@ -336,7 +333,129 @@ func formatContextUsage(hookData statuslineHookData, lowThreshold, mediumThresho
 		color = "\033[31m"
 	}
 
-	return fmt.Sprintf("%s %s(%d%%)\033[0m", formatNumber(cw.InputTokens), color, percentage)
+	return fmt.Sprintf("%s %s(%d%%)\033[0m", formatNumber(inputTokens), color, percentage)
+}
+
+// resolveContextTokens returns (inputTokens, contextWindowLimit).
+// Prefers hook data; falls back to reading the transcript file.
+func resolveContextTokens(hookData statuslineHookData) (int, int) {
+	if hookData.ContextWindow != nil && hookData.ContextWindow.ContextWindow > 0 {
+		return hookData.ContextWindow.InputTokens, hookData.ContextWindow.ContextWindow
+	}
+
+	// Fallback: read last usage entry from transcript JSONL
+	if hookData.TranscriptPath == "" {
+		return 0, 0
+	}
+
+	inputTokens := readContextFromTranscript(hookData.TranscriptPath)
+	if inputTokens <= 0 {
+		return 0, 0
+	}
+
+	return inputTokens, modelContextWindow(hookData.Model.ID)
+}
+
+// transcriptUsage is the minimal structure we need from a transcript JSONL line.
+type transcriptUsage struct {
+	Message *struct {
+		Usage *struct {
+			InputTokens              int `json:"input_tokens"`
+			CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+			CacheReadInputTokens     int `json:"cache_read_input_tokens"`
+		} `json:"usage"`
+	} `json:"message"`
+}
+
+const transcriptReadChunk = 8192 // 8 KB per chunk, grows if needed
+
+// readContextFromTranscript seeks from the end of the transcript JSONL and returns
+// the total input tokens (input + cache_creation + cache_read) of the last assistant turn.
+// Reads backwards in chunks to avoid loading the entire file.
+func readContextFromTranscript(path string) int {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0
+	}
+	defer f.Close()
+
+	size, err := f.Seek(0, io.SeekEnd)
+	if err != nil || size == 0 {
+		return 0
+	}
+
+	buf := make([]byte, 0, transcriptReadChunk)
+	offset := size
+
+	for offset > 0 {
+		chunkSize := min(int64(transcriptReadChunk), offset)
+		offset -= chunkSize
+
+		chunk := make([]byte, chunkSize)
+		if _, err := f.ReadAt(chunk, offset); err != nil {
+			break
+		}
+		// Prepend new chunk to buffer
+		buf = append(chunk, buf...)
+
+		// Scan lines from the end of current buffer
+		if tokens := scanLastUsageLine(buf); tokens > 0 {
+			return tokens
+		}
+
+		// If we've read the whole file and found nothing, stop
+		if offset == 0 {
+			break
+		}
+	}
+	return 0
+}
+
+// scanLastUsageLine parses lines from the end of buf and returns tokens from the
+// last line that contains valid usage data, or 0 if none found.
+func scanLastUsageLine(buf []byte) int {
+	// Find line boundaries from end
+	end := len(buf)
+	for end > 0 {
+		start := end - 1
+		// Skip trailing newline
+		for start >= 0 && buf[start] == '\n' {
+			start--
+		}
+		if start < 0 {
+			break
+		}
+		// Find start of this line
+		lineEnd := start + 1
+		for start > 0 && buf[start-1] != '\n' {
+			start--
+		}
+		line := buf[start:lineEnd]
+		end = start
+
+		if len(line) == 0 {
+			continue
+		}
+		var entry transcriptUsage
+		if err := json.Unmarshal(line, &entry); err != nil {
+			continue
+		}
+		if entry.Message == nil || entry.Message.Usage == nil {
+			continue
+		}
+		u := entry.Message.Usage
+		total := u.InputTokens + u.CacheCreationInputTokens + u.CacheReadInputTokens
+		if total > 0 {
+			return total
+		}
+	}
+	return 0
+}
+
+// modelContextWindow returns the context window size for known Claude models.
+// All recent Claude models use 200k; kept as a hook for future model-specific limits.
+func modelContextWindow(_ string) int {
+	return 200000
 }
 
 // --- Cache helpers ---
